@@ -10,11 +10,7 @@ func Configure(cfg Map) {
 }
 
 // Register 开放给外
-func Register(name string, value Any, overrides ...bool) {
-	override := true
-	if len(overrides) > 0 {
-		override = overrides[0]
-	}
+func Register(name string, value Any) {
 	module.Register(name, value)
 }
 

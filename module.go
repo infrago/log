@@ -5,6 +5,7 @@ import (
 	"time"
 
 	. "github.com/infrago/base"
+	"github.com/infrago/infra"
 )
 
 func init() {
@@ -96,7 +97,7 @@ func (this *Module) Driver(name string, driver Driver) {
 		panic("Invalid log driver: " + name)
 	}
 
-	if override {
+	if infra.Override() {
 		this.drivers[name] = driver
 	} else {
 		if this.drivers[name] == nil {
@@ -113,7 +114,7 @@ func (this *Module) Config(name string, config Config) {
 		name = infra.DEFAULT
 	}
 
-	if override {
+	if infra.Override() {
 		this.configs[name] = config
 	} else {
 		if _, ok := this.configs[name]; ok == false {
