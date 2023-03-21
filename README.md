@@ -1,2 +1,2 @@
 # log
-infra.go log module.
+infra.Go log module.
