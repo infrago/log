@@ -1,7 +1,6 @@
 package log
 
 import (
-	"fmt"
 	"strings"
 
 	. "github.com/infrago/base"
@@ -180,8 +179,6 @@ func (this *Module) Connect() {
 		inst := &Instance{
 			nil, name, config, config.Setting,
 		}
-
-		fmt.Println("ssss", name, config.Setting)
 
 		// 建立连接
 		connect, err := driver.Connect(inst)

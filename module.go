@@ -149,6 +149,6 @@ func (this *Module) Flush() {
 
 // Logging 对外按日志级写日志的方法
 func (this *Module) Logging(level Level, body string) {
-	log := Log{Time: time.Now().UnixNano(), Level: level, Body: body}
+	log := Log{Time: time.Now(), Level: level, Body: body}
 	this.Write(log)
 }

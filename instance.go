@@ -3,7 +3,6 @@ package log
 import (
 	"strconv"
 	"strings"
-	"time"
 
 	. "github.com/infrago/base"
 	"github.com/infrago/infra"
@@ -23,8 +22,8 @@ type (
 func (this *Instance) Format(log Log) string {
 	message := this.Config.Format
 
-	message = strings.Replace(message, "%nano%", strconv.FormatInt(log.Time, 10), -1)
-	message = strings.Replace(message, "%time%", time.Unix(0, log.Time).Format("2006/01/02 15:04:05.000"), -1)
+	message = strings.Replace(message, "%nano%", strconv.FormatInt(log.Time.UnixNano(), 10), -1)
+	message = strings.Replace(message, "%time%", log.Time.Format("2006/01/02 15:04:05.000"), -1)
 	message = strings.Replace(message, "%role%", infra.Role(), -1)
 	message = strings.Replace(message, "%node%", infra.Node(), -1)
 	message = strings.Replace(message, "%flag%", this.Config.Flag, -1)
@@ -46,7 +45,7 @@ func (this *Instance) Mapping(log Log) Map {
 		"version": infra.Version(),
 		"level":   levelStrings[log.Level],
 		"body":    log.Body,
-		"time":    time.Unix(0, log.Time).Format("2006/01/02 15:04:05.000"),
+		"time":    log.Time,
 	}
 }
 

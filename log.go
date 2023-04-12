@@ -10,9 +10,9 @@ import (
 type (
 	Logs = []Log
 	Log  struct {
-		Time  int64  `json:"time"`
-		Level Level  `json:"level"`
-		Body  string `json:"body"`
+		Time  time.Time `json:"time"`
+		Level Level     `json:"level"`
+		Body  string    `json:"body"`
 	}
 )
 
@@ -25,7 +25,7 @@ func (log *Log) Mapping() Map {
 		"version": infra.Version(),
 		"level":   levelStrings[log.Level],
 		"body":    log.Body,
-		"time":    time.Unix(0, log.Time).Format("2006/01/02 15:04:05.000"),
+		"time":    log.Time,
 	}
 }
 
