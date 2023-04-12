@@ -1,6 +1,7 @@
 package log
 
 import (
+	"fmt"
 	"strings"
 
 	. "github.com/infrago/base"
@@ -97,7 +98,7 @@ func (this *Module) Configure(global Map) {
 	rootConfig := Map{}
 
 	for key, val := range config {
-		if conf, ok := val.(Map); ok {
+		if conf, ok := val.(Map); ok && key != "setting" {
 			this.configure(key, conf)
 		} else {
 			rootConfig[key] = val
@@ -179,6 +180,8 @@ func (this *Module) Connect() {
 		inst := &Instance{
 			nil, name, config, config.Setting,
 		}
+
+		fmt.Println("ssss", name, config.Setting)
 
 		// 建立连接
 		connect, err := driver.Connect(inst)
