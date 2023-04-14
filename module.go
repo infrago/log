@@ -63,15 +63,17 @@ type (
 		// 开启后，所有日志 body 都会被包装成json格式输出
 		Json bool
 
-		// Sync 是否开启同步输出，默认为false，表示异步输出
-		// 注意：如果开启同步输出，有可能影响程序性能
-		Sync bool
+		// Buffer 缓冲大小
+		// 最大缓存多少条日志
+		Buffer int
 
-		// Pool 异步缓冲池大小
-		Pool int
+		// Timeout 超时输出时间
+		// 当日志少时，超时时间到了，也要强制输出
+		// 而且应该要一个默认值，比如 1秒，这个参数可以和Buffer配合
+		// 根据每个项目的日志量不同，来动态处理
+		Timeout time.Duration
 
 		//Flag 标记
-		// 默认为infra.Role()，表名当前节点的角色
 		Flag string `toml:"flag"`
 
 		// Format 日志输出格式，默认格式为 %time% [%level%] %body%
@@ -129,11 +131,9 @@ func (this *Module) Configs(config Configs) {
 }
 
 // Write 写入日志，对外的，需要处理逻辑
+
 func (this *Module) Write(log Log) {
 	for _, inst := range this.instances {
-		// if log.Level > inst.Config.Level {
-		// 	return
-		// }
 		//自定义级别的输出
 		if yes, ok := inst.Config.Levels[log.Level]; ok && yes {
 			inst.connect.Write(log)
@@ -141,10 +141,16 @@ func (this *Module) Write(log Log) {
 	}
 }
 
+// Flush 冲干净
+// 待优化，当开启缓冲的时候
+// 直接在模块里分段输出，比如，缓冲设置为1000时
+// 为了减少驱动一次写太多的压力，可以100条分10次输出
+// 比如，数据库记录日志时，一次写10000条可能会有点慢
+// 不过哪个傻缺会把缓冲设置为10000呢？
 func (this *Module) Flush() {
-	for _, inst := range this.instances {
-		inst.connect.Flush()
-	}
+	// for _, inst := range this.instances {
+	// 	inst.connect.Flush()
+	// }
 }
 
 // Logging 对外按日志级写日志的方法

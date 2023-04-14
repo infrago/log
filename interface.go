@@ -5,6 +5,7 @@ import (
 
 	. "github.com/infrago/base"
 	"github.com/infrago/infra"
+	"github.com/infrago/util"
 )
 
 func (this *Module) Register(name string, value Any) {
@@ -56,10 +57,7 @@ func (this *Module) configure(name string, config Map) {
 	if json, ok := config["json"].(bool); ok {
 		cfg.Json = json
 	}
-	//设置是否同步
-	if sync, ok := config["sync"].(bool); ok {
-		cfg.Sync = sync
-	}
+
 	// 设置输出格式
 	if flag, ok := config["flag"].(string); ok {
 		cfg.Flag = flag
@@ -70,13 +68,12 @@ func (this *Module) configure(name string, config Map) {
 	}
 
 	// 设置缓存池大小
-	if pool, ok := config["pool"].(int64); ok && pool > 0 {
-		cfg.Pool = int(pool)
-	}
-	if pool, ok := config["pool"].(int); ok && pool > 0 {
-		cfg.Pool = pool
-	}
+	cfg.Buffer = int(util.MapInt(config, "buffer", "pool"))
 
+	//超时时间
+	cfg.Timeout = util.ParseDurationConfig(config, "timeout")
+
+	//设置
 	if setting, ok := config["setting"].(Map); ok {
 		cfg.Setting = setting
 	}

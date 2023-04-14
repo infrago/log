@@ -16,9 +16,6 @@ type (
 		Close() error
 
 		// Write 写入日志
-		Write(Log) error
-
-		// Flush 冲马桶
-		Flush()
+		Write(...Log) error
 	}
 )
