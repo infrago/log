@@ -261,6 +261,7 @@ func (m *Module) Start() {
 	go m.loop(flushEvery)
 
 	m.started = true
+	fmt.Printf("bamgoo log module is running with %d connections.\n", len(m.instances))
 }
 
 func (m *Module) Stop() {
