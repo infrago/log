@@ -19,7 +19,7 @@ type (
 	}
 )
 
-func (d *defaultDriver) Connect(inst *Instance) (Connect, error) {
+func (d *defaultDriver) Connect(inst *Instance) (Connection, error) {
 	return &defaultConnection{
 		instance: inst,
 		stdout:   os.Stdout,

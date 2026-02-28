@@ -2,10 +2,10 @@ package log
 
 type (
 	Driver interface {
-		Connect(*Instance) (Connect, error)
+		Connect(*Instance) (Connection, error)
 	}
 
-	Connect interface {
+	Connection interface {
 		Open() error
 		Close() error
 		Write(logs ...Log) error

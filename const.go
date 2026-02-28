@@ -19,6 +19,16 @@ var (
 	errInvalidLogDriver = errors.New("invalid log driver")
 )
 
+const (
+	OverflowDrop       = "drop"
+	OverflowDropNewest = "drop_newest"
+	OverflowDropOldest = "drop_oldest"
+	OverflowBlock      = "block"
+
+	DropOld = "old"
+	DropNew = "new"
+)
+
 var levelStrings = map[Level]string{
 	LevelFatal:   "FATAL",
 	LevelPanic:   "PANIC",
