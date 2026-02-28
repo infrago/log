@@ -23,13 +23,15 @@ type Instance struct {
 func (inst *Instance) Format(entry Log) string {
 	if inst.Config.Json {
 		payload := map[string]any{
-			"time":  entry.Time.Format("2006-01-02 15:04:05.000"),
-			"unix":  entry.Time.Unix(),
-			"nano":  entry.Time.UnixNano(),
-			"level": levelStrings[entry.Level],
-			"name":  inst.Name,
-			"flag":  inst.Config.Flag,
-			"body":  entry.Body,
+			"time":    entry.Time.Format("2006-01-02 15:04:05.000"),
+			"unix":    entry.Time.Unix(),
+			"nano":    entry.Time.UnixNano(),
+			"level":   levelStrings[entry.Level],
+			"flag":    inst.Config.Flag,
+			"body":    entry.Body,
+			"project": entry.Project,
+			"profile": entry.Profile,
+			"node":    entry.Node,
 		}
 		if len(entry.Fields) > 0 {
 			payload["fields"] = entry.Fields
@@ -50,9 +52,9 @@ func (inst *Instance) Format(entry Log) string {
 	message = strings.ReplaceAll(message, "%flag%", inst.Config.Flag)
 	message = strings.ReplaceAll(message, "%level%", levelStrings[entry.Level])
 	message = strings.ReplaceAll(message, "%body%", entry.Body)
-	message = strings.ReplaceAll(message, "%project%", fieldString(entry.Fields, "project"))
-	message = strings.ReplaceAll(message, "%profile%", fieldString(entry.Fields, "profile"))
-	message = strings.ReplaceAll(message, "%node%", fieldString(entry.Fields, "node"))
+	message = strings.ReplaceAll(message, "%project%", entry.Project)
+	message = strings.ReplaceAll(message, "%profile%", entry.Profile)
+	message = strings.ReplaceAll(message, "%node%", entry.Node)
 	if len(entry.Fields) > 0 {
 		message += " " + formatFields(entry.Fields)
 	}
@@ -60,7 +62,7 @@ func (inst *Instance) Format(entry Log) string {
 	return message
 }
 
-func (inst *Instance) Allow(level Level, body string, fields Map) bool {
+func (inst *Instance) Allow(level Level, body, project, profile, node string, fields Map) bool {
 	if !inst.Config.Levels[level] {
 		return false
 	}
@@ -71,7 +73,7 @@ func (inst *Instance) Allow(level Level, body string, fields Map) bool {
 	if r <= 0 {
 		return false
 	}
-	return hash01(level, inst.Name, body, fields) <= r
+	return hash01(level, inst.Name, body, project, profile, node, fields) <= r
 }
 
 func normalizeLevels(cfg Config) Config {
@@ -136,13 +138,19 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
-func hash01(level Level, name, body string, fields Map) float64 {
+func hash01(level Level, name, body, project, profile, node string, fields Map) float64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(strconv.Itoa(level)))
 	_, _ = h.Write([]byte(":"))
 	_, _ = h.Write([]byte(name))
 	_, _ = h.Write([]byte(":"))
 	_, _ = h.Write([]byte(body))
+	_, _ = h.Write([]byte(":"))
+	_, _ = h.Write([]byte(project))
+	_, _ = h.Write([]byte(":"))
+	_, _ = h.Write([]byte(profile))
+	_, _ = h.Write([]byte(":"))
+	_, _ = h.Write([]byte(node))
 	if len(fields) > 0 {
 		keys := make([]string, 0, len(fields))
 		for k := range fields {
@@ -171,14 +179,4 @@ func formatFields(fields Map) string {
 		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
 	}
 	return strings.Join(parts, " ")
-}
-
-func fieldString(fields Map, key string) string {
-	if fields == nil {
-		return ""
-	}
-	if v, ok := fields[key]; ok {
-		return fmt.Sprintf("%v", v)
-	}
-	return ""
 }

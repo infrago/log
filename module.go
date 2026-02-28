@@ -91,10 +91,13 @@ type (
 	}
 
 	Log struct {
-		Time   time.Time
-		Level  Level
-		Body   string
-		Fields Map
+		Time    time.Time
+		Level   Level
+		Body    string
+		Project string
+		Profile string
+		Node    string
+		Fields  Map
 	}
 )
 
@@ -478,7 +481,7 @@ func (m *Module) dispatch(entries []Log) int {
 	for _, inst := range instances {
 		filtered := make([]Log, 0, len(entries))
 		for _, entry := range entries {
-			if inst.Allow(entry.Level, entry.Body, entry.Fields) {
+			if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Profile, entry.Node, entry.Fields) {
 				filtered = append(filtered, entry)
 			}
 		}
@@ -504,7 +507,7 @@ func (m *Module) Write(entry Log) {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now()
 	}
-	entry.Fields = ensureIdentityFields(entry.Fields)
+	entry = ensureIdentity(entry)
 
 	m.mutex.RLock()
 	started := m.started
@@ -556,7 +559,7 @@ func (m *Module) Write(entry Log) {
 	}
 	m.mutex.RUnlock()
 	for _, inst := range instances {
-		if !inst.Allow(entry.Level, entry.Body, entry.Fields) {
+		if !inst.Allow(entry.Level, entry.Body, entry.Project, entry.Profile, entry.Node, entry.Fields) {
 			continue
 		}
 		if err := inst.connect.Write(entry); err != nil {
@@ -573,21 +576,18 @@ func (m *Module) Write(entry Log) {
 	m.totalDispatchNs.Add(elapsed.Nanoseconds())
 }
 
-func ensureIdentityFields(fields Map) Map {
-	if fields == nil {
-		fields = Map{}
-	}
+func ensureIdentity(entry Log) Log {
 	identity := bamgoo.Identity()
-	if _, ok := fields["project"]; !ok {
-		fields["project"] = identity.Project
+	if strings.TrimSpace(entry.Project) == "" {
+		entry.Project = identity.Project
 	}
-	if _, ok := fields["profile"]; !ok {
-		fields["profile"] = identity.Profile
+	if strings.TrimSpace(entry.Profile) == "" {
+		entry.Profile = identity.Profile
 	}
-	if _, ok := fields["node"]; !ok {
-		fields["node"] = identity.Node
+	if strings.TrimSpace(entry.Node) == "" {
+		entry.Node = identity.Node
 	}
-	return fields
+	return entry
 }
 
 func (m *Module) Stats() Map {
