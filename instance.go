@@ -20,10 +20,12 @@ type Instance struct {
 	Setting map[string]any
 }
 
+const logTimeFormat = "2006-01-02 15:04:05.000000"
+
 func (inst *Instance) Format(entry Log) string {
 	if inst.Config.Json {
 		payload := map[string]any{
-			"time":    entry.Time.Format("2006-01-02 15:04:05.000"),
+			"time":    entry.Time.Format(logTimeFormat),
 			"unix":    entry.Time.Unix(),
 			"nano":    entry.Time.UnixNano(),
 			"level":   levelStrings[entry.Level],
@@ -47,7 +49,7 @@ func (inst *Instance) Format(entry Log) string {
 
 	message = strings.ReplaceAll(message, "%nano%", strconv.FormatInt(entry.Time.UnixNano(), 10))
 	message = strings.ReplaceAll(message, "%unix%", strconv.FormatInt(entry.Time.Unix(), 10))
-	message = strings.ReplaceAll(message, "%time%", entry.Time.Format("2006-01-02 15:04:05.000"))
+	message = strings.ReplaceAll(message, "%time%", entry.Time.Format(logTimeFormat))
 	message = strings.ReplaceAll(message, "%name%", inst.Name)
 	message = strings.ReplaceAll(message, "%flag%", inst.Config.Flag)
 	message = strings.ReplaceAll(message, "%level%", levelStrings[entry.Level])
