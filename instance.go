@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/bamgoo/base"
+	. "github.com/infrago/base"
 )
 
 type Instance struct {

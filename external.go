@@ -2,7 +2,7 @@ package log
 
 import "fmt"
 
-import . "github.com/bamgoo/base"
+import . "github.com/infrago/base"
 
 func Levels() map[Level]string {
 	out := make(map[Level]string, len(levelStrings))

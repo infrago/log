@@ -1,5 +1,5 @@
 # log
-bamgoo log module.
+infrago log module.
 
 ## API
 

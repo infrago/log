@@ -9,12 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bamgoo/bamgoo"
-	. "github.com/bamgoo/base"
+	"github.com/infrago/infra"
+	. "github.com/infrago/base"
 )
 
 func init() {
-	bamgoo.Mount(module)
+	infra.Mount(module)
 }
 
 var module = &Module{
@@ -123,12 +123,12 @@ func (m *Module) RegisterDriver(name string, driver Driver) {
 	defer m.mutex.Unlock()
 
 	if name == "" {
-		name = bamgoo.DEFAULT
+		name = infra.DEFAULT
 	}
 	if driver == nil {
 		panic(errInvalidLogDriver)
 	}
-	if bamgoo.Override() {
+	if infra.Override() {
 		m.drivers[name] = driver
 	} else {
 		if _, ok := m.drivers[name]; !ok {
@@ -146,9 +146,9 @@ func (m *Module) RegisterConfig(name string, cfg Config) {
 	}
 
 	if name == "" {
-		name = bamgoo.DEFAULT
+		name = infra.DEFAULT
 	}
-	if bamgoo.Override() {
+	if infra.Override() {
 		m.configs[name] = cfg
 	} else {
 		if _, ok := m.configs[name]; !ok {
@@ -189,12 +189,12 @@ func (m *Module) Config(global Map) {
 		}
 	}
 	if len(rootConfig) > 0 {
-		m.configure(bamgoo.DEFAULT, rootConfig)
+		m.configure(infra.DEFAULT, rootConfig)
 	}
 }
 
 func (m *Module) configure(name string, conf Map) {
-	cfg := Config{Driver: bamgoo.DEFAULT, Level: LevelDebug, Sample: 1}
+	cfg := Config{Driver: infra.DEFAULT, Level: LevelDebug, Sample: 1}
 	if existing, ok := m.configs[name]; ok {
 		cfg = existing
 	}
@@ -254,8 +254,8 @@ func (m *Module) Setup() {
 	}
 
 	if len(m.configs) == 0 {
-		m.configs[bamgoo.DEFAULT] = normalizeConfig(Config{
-			Driver: bamgoo.DEFAULT,
+		m.configs[infra.DEFAULT] = normalizeConfig(Config{
+			Driver: infra.DEFAULT,
 			Level:  LevelDebug,
 		})
 		return
@@ -360,7 +360,7 @@ func (m *Module) Start() {
 	go m.loop(flushEvery, batchSize)
 
 	m.started = true
-	fmt.Printf("bamgoo log module is running with %d connections.\n", len(m.instances))
+	fmt.Printf("infrago log module is running with %d connections.\n", len(m.instances))
 }
 
 func (m *Module) Stop() {
@@ -462,7 +462,7 @@ func (m *Module) reportDropped() {
 	if n == 0 {
 		return
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "bamgoo log queue is full, dropped %d entries\n", n)
+	_, _ = fmt.Fprintf(os.Stderr, "infrago log queue is full, dropped %d entries\n", n)
 }
 
 func (m *Module) dispatch(entries []Log) int {
@@ -577,7 +577,7 @@ func (m *Module) Write(entry Log) {
 }
 
 func ensureIdentity(entry Log) Log {
-	identity := bamgoo.Identity()
+	identity := infra.Identity()
 	if strings.TrimSpace(entry.Project) == "" {
 		entry.Project = identity.Project
 	}
