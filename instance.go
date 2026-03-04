@@ -3,10 +3,13 @@ package log
 import (
 	"encoding/json"
 	"fmt"
+	"hash"
 	"hash/fnv"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/infrago/base"
@@ -18,6 +21,9 @@ type Instance struct {
 	Name    string
 	Config  Config
 	Setting map[string]any
+
+	formatOnce  sync.Once
+	formatParts []formatPart
 }
 
 const logTimeFormat = "2006-01-02 15:04:05.000000"
@@ -42,21 +48,7 @@ func (inst *Instance) Format(entry Log) string {
 		return string(body)
 	}
 
-	message := inst.Config.Format
-	if message == "" {
-		message = "%time% [%level%] %body%"
-	}
-
-	message = strings.ReplaceAll(message, "%nano%", strconv.FormatInt(entry.Time.UnixNano(), 10))
-	message = strings.ReplaceAll(message, "%unix%", strconv.FormatInt(entry.Time.Unix(), 10))
-	message = strings.ReplaceAll(message, "%time%", entry.Time.Format(logTimeFormat))
-	message = strings.ReplaceAll(message, "%name%", inst.Name)
-	message = strings.ReplaceAll(message, "%flag%", inst.Config.Flag)
-	message = strings.ReplaceAll(message, "%level%", levelStrings[entry.Level])
-	message = strings.ReplaceAll(message, "%body%", entry.Body)
-	message = strings.ReplaceAll(message, "%project%", entry.Project)
-	message = strings.ReplaceAll(message, "%profile%", entry.Profile)
-	message = strings.ReplaceAll(message, "%node%", entry.Node)
+	message := inst.formatText(entry)
 	if len(entry.Fields) > 0 {
 		message += " " + formatFields(entry.Fields)
 	}
@@ -142,17 +134,17 @@ func normalizeConfig(cfg Config) Config {
 
 func hash01(level Level, name, body, project, profile, node string, fields Map) float64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(strconv.Itoa(level)))
-	_, _ = h.Write([]byte(":"))
-	_, _ = h.Write([]byte(name))
-	_, _ = h.Write([]byte(":"))
-	_, _ = h.Write([]byte(body))
-	_, _ = h.Write([]byte(":"))
-	_, _ = h.Write([]byte(project))
-	_, _ = h.Write([]byte(":"))
-	_, _ = h.Write([]byte(profile))
-	_, _ = h.Write([]byte(":"))
-	_, _ = h.Write([]byte(node))
+	hashWrite(h, strconv.Itoa(level))
+	hashWrite(h, ":")
+	hashWrite(h, name)
+	hashWrite(h, ":")
+	hashWrite(h, body)
+	hashWrite(h, ":")
+	hashWrite(h, project)
+	hashWrite(h, ":")
+	hashWrite(h, profile)
+	hashWrite(h, ":")
+	hashWrite(h, node)
 	if len(fields) > 0 {
 		keys := make([]string, 0, len(fields))
 		for k := range fields {
@@ -160,10 +152,10 @@ func hash01(level Level, name, body, project, profile, node string, fields Map) 
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			_, _ = h.Write([]byte("|"))
-			_, _ = h.Write([]byte(k))
-			_, _ = h.Write([]byte("="))
-			_, _ = h.Write([]byte(fmt.Sprintf("%v", fields[k])))
+			hashWrite(h, "|")
+			hashWrite(h, k)
+			hashWrite(h, "=")
+			hashWrite(h, fmt.Sprint(fields[k]))
 		}
 	}
 	v := h.Sum64()
@@ -176,9 +168,131 @@ func formatFields(fields Map) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
+	var b strings.Builder
 	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(fmt.Sprint(fields[k]))
 	}
-	return strings.Join(parts, " ")
+	return b.String()
+}
+
+type formatToken int
+
+const (
+	tokenLiteral formatToken = iota
+	tokenNano
+	tokenUnix
+	tokenTime
+	tokenName
+	tokenFlag
+	tokenLevel
+	tokenBody
+	tokenProject
+	tokenProfile
+	tokenNode
+)
+
+type formatPart struct {
+	token formatToken
+	text  string
+}
+
+var formatTokens = []struct {
+	key   string
+	token formatToken
+}{
+	{"%nano%", tokenNano},
+	{"%unix%", tokenUnix},
+	{"%time%", tokenTime},
+	{"%name%", tokenName},
+	{"%flag%", tokenFlag},
+	{"%level%", tokenLevel},
+	{"%body%", tokenBody},
+	{"%project%", tokenProject},
+	{"%profile%", tokenProfile},
+	{"%node%", tokenNode},
+}
+
+func (inst *Instance) formatText(entry Log) string {
+	inst.formatOnce.Do(func() {
+		message := inst.Config.Format
+		if message == "" {
+			message = "%time% [%level%] %body%"
+		}
+		inst.formatParts = compileFormat(message)
+	})
+
+	var b strings.Builder
+	b.Grow(len(inst.Config.Format) + len(entry.Body) + 64)
+	for _, part := range inst.formatParts {
+		switch part.token {
+		case tokenLiteral:
+			b.WriteString(part.text)
+		case tokenNano:
+			b.WriteString(strconv.FormatInt(entry.Time.UnixNano(), 10))
+		case tokenUnix:
+			b.WriteString(strconv.FormatInt(entry.Time.Unix(), 10))
+		case tokenTime:
+			b.WriteString(entry.Time.Format(logTimeFormat))
+		case tokenName:
+			b.WriteString(inst.Name)
+		case tokenFlag:
+			b.WriteString(inst.Config.Flag)
+		case tokenLevel:
+			b.WriteString(levelStrings[entry.Level])
+		case tokenBody:
+			b.WriteString(entry.Body)
+		case tokenProject:
+			b.WriteString(entry.Project)
+		case tokenProfile:
+			b.WriteString(entry.Profile)
+		case tokenNode:
+			b.WriteString(entry.Node)
+		}
+	}
+	return b.String()
+}
+
+func compileFormat(format string) []formatPart {
+	if format == "" {
+		return []formatPart{{token: tokenLiteral, text: "%time% [%level%] %body%"}}
+	}
+
+	parts := make([]formatPart, 0, 8)
+	for len(format) > 0 {
+		idx := strings.IndexByte(format, '%')
+		if idx < 0 {
+			parts = append(parts, formatPart{token: tokenLiteral, text: format})
+			break
+		}
+		if idx > 0 {
+			parts = append(parts, formatPart{token: tokenLiteral, text: format[:idx]})
+			format = format[idx:]
+		}
+
+		matched := false
+		for _, item := range formatTokens {
+			if strings.HasPrefix(format, item.key) {
+				parts = append(parts, formatPart{token: item.token})
+				format = format[len(item.key):]
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+
+		parts = append(parts, formatPart{token: tokenLiteral, text: "%"})
+		format = format[1:]
+	}
+	return parts
+}
+
+func hashWrite(h hash.Hash64, text string) {
+	_, _ = io.WriteString(h, text)
 }

@@ -48,10 +48,14 @@ func (c *defaultConnection) Write(logs ...Log) error {
 	}
 
 	if errBuf.Len() > 0 {
-		_, _ = c.stderr.Write(errBuf.Bytes())
+		if _, err := c.stderr.Write(errBuf.Bytes()); err != nil {
+			return err
+		}
 	}
 	if outBuf.Len() > 0 {
-		_, _ = c.stdout.Write(outBuf.Bytes())
+		if _, err := c.stdout.Write(outBuf.Bytes()); err != nil {
+			return err
+		}
 	}
 	return nil
 }

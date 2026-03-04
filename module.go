@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/infrago/infra"
 	. "github.com/infrago/base"
+	"github.com/infrago/infra"
 )
 
 func init() {
@@ -274,9 +274,17 @@ func (m *Module) Open() {
 		return
 	}
 
+	opened := make([]Connection, 0, len(m.configs))
+	rollback := func() {
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+		m.instances = make(map[string]*Instance, 0)
+	}
 	for name, cfg := range m.configs {
 		driver := m.drivers[cfg.Driver]
 		if driver == nil {
+			rollback()
 			panic("invalid log driver: " + cfg.Driver)
 		}
 
@@ -288,13 +296,17 @@ func (m *Module) Open() {
 
 		conn, err := driver.Connect(inst)
 		if err != nil {
-			panic("failed to connect log: " + err.Error())
+			rollback()
+			panic("failed to connect log " + name + ": " + err.Error())
 		}
 		if err := conn.Open(); err != nil {
-			panic("failed to open log: " + err.Error())
+			rollback()
+			_ = conn.Close()
+			panic("failed to open log " + name + ": " + err.Error())
 		}
 		inst.connect = conn
 		m.instances[name] = inst
+		opened = append(opened, conn)
 	}
 
 	m.opened = true
@@ -341,7 +353,7 @@ func (m *Module) Start() {
 		if workerQueueSize <= 0 {
 			workerQueueSize = 256
 		}
-		worker := newInstanceWriter(inst, mode, workerQueueSize)
+		worker := newInstanceWriter(inst, parseOverflow(inst.Config), workerQueueSize)
 		m.writers[name] = worker
 		worker.start()
 	}
@@ -507,6 +519,9 @@ func (m *Module) Write(entry Log) {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now()
 	}
+	if entry.Fields != nil {
+		entry.Fields = cloneMap(entry.Fields)
+	}
 	entry = ensureIdentity(entry)
 
 	m.mutex.RLock()
@@ -518,6 +533,7 @@ func (m *Module) Write(entry Log) {
 	if started && queue != nil {
 		if mode == overflowBlock {
 			queue <- entry
+			m.queuedCount.Add(1)
 			return
 		}
 		select {
