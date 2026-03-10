@@ -95,6 +95,7 @@ type (
 		Level   Level
 		Body    string
 		Project string
+		Role    string
 		Profile string
 		Node    string
 		Fields  Map
@@ -493,7 +494,7 @@ func (m *Module) dispatch(entries []Log) int {
 	for _, inst := range instances {
 		filtered := make([]Log, 0, len(entries))
 		for _, entry := range entries {
-			if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Profile, entry.Node, entry.Fields) {
+			if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
 				filtered = append(filtered, entry)
 			}
 		}
@@ -575,7 +576,7 @@ func (m *Module) Write(entry Log) {
 	}
 	m.mutex.RUnlock()
 	for _, inst := range instances {
-		if !inst.Allow(entry.Level, entry.Body, entry.Project, entry.Profile, entry.Node, entry.Fields) {
+		if !inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
 			continue
 		}
 		if err := inst.connect.Write(entry); err != nil {
@@ -596,6 +597,9 @@ func ensureIdentity(entry Log) Log {
 	identity := infra.Identity()
 	if strings.TrimSpace(entry.Project) == "" {
 		entry.Project = identity.Project
+	}
+	if strings.TrimSpace(entry.Role) == "" {
+		entry.Role = identity.Role
 	}
 	if strings.TrimSpace(entry.Profile) == "" {
 		entry.Profile = identity.Profile

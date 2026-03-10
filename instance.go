@@ -38,6 +38,7 @@ func (inst *Instance) Format(entry Log) string {
 			"flag":    inst.Config.Flag,
 			"body":    entry.Body,
 			"project": entry.Project,
+			"role":    entry.Role,
 			"profile": entry.Profile,
 			"node":    entry.Node,
 		}
@@ -56,7 +57,7 @@ func (inst *Instance) Format(entry Log) string {
 	return message
 }
 
-func (inst *Instance) Allow(level Level, body, project, profile, node string, fields Map) bool {
+func (inst *Instance) Allow(level Level, body, project, role, profile, node string, fields Map) bool {
 	if !inst.Config.Levels[level] {
 		return false
 	}
@@ -67,7 +68,7 @@ func (inst *Instance) Allow(level Level, body, project, profile, node string, fi
 	if r <= 0 {
 		return false
 	}
-	return hash01(level, inst.Name, body, project, profile, node, fields) <= r
+	return hash01(level, inst.Name, body, project, role, profile, node, fields) <= r
 }
 
 func normalizeLevels(cfg Config) Config {
@@ -132,7 +133,7 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
-func hash01(level Level, name, body, project, profile, node string, fields Map) float64 {
+func hash01(level Level, name, body, project, role, profile, node string, fields Map) float64 {
 	h := fnv.New64a()
 	hashWrite(h, strconv.Itoa(level))
 	hashWrite(h, ":")
@@ -141,6 +142,8 @@ func hash01(level Level, name, body, project, profile, node string, fields Map) 
 	hashWrite(h, body)
 	hashWrite(h, ":")
 	hashWrite(h, project)
+	hashWrite(h, ":")
+	hashWrite(h, role)
 	hashWrite(h, ":")
 	hashWrite(h, profile)
 	hashWrite(h, ":")
@@ -192,6 +195,7 @@ const (
 	tokenLevel
 	tokenBody
 	tokenProject
+	tokenRole
 	tokenProfile
 	tokenNode
 )
@@ -213,6 +217,7 @@ var formatTokens = []struct {
 	{"%level%", tokenLevel},
 	{"%body%", tokenBody},
 	{"%project%", tokenProject},
+	{"%role%", tokenRole},
 	{"%profile%", tokenProfile},
 	{"%node%", tokenNode},
 }
@@ -248,6 +253,8 @@ func (inst *Instance) formatText(entry Log) string {
 			b.WriteString(entry.Body)
 		case tokenProject:
 			b.WriteString(entry.Project)
+		case tokenRole:
+			b.WriteString(entry.Role)
 		case tokenProfile:
 			b.WriteString(entry.Profile)
 		case tokenNode:
