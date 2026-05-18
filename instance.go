@@ -17,6 +17,7 @@ import (
 
 type Instance struct {
 	connect Connection
+	writeMu sync.RWMutex
 
 	Name    string
 	Config  Config
@@ -24,6 +25,10 @@ type Instance struct {
 
 	formatOnce  sync.Once
 	formatParts []formatPart
+
+	sampleMillion uint64
+	allLevels     bool
+	needsSample   bool
 }
 
 const logTimeFormat = "2006-01-02 15:04:05.000000"
@@ -45,8 +50,16 @@ func (inst *Instance) Format(entry Log) string {
 		if len(entry.Fields) > 0 {
 			payload["fields"] = entry.Fields
 		}
-		body, _ := json.Marshal(payload)
-		return string(body)
+		body, err := json.Marshal(payload)
+		if err == nil {
+			return string(body)
+		}
+		payload["fields"] = stringifyFields(entry.Fields, err)
+		body, err = json.Marshal(payload)
+		if err == nil {
+			return string(body)
+		}
+		return inst.formatText(entry) + " " + formatFields(entry.Fields)
 	}
 
 	message := inst.formatText(entry)
@@ -61,14 +74,40 @@ func (inst *Instance) Allow(level Level, body, project, role, profile, node stri
 	if !inst.Config.Levels[level] {
 		return false
 	}
-	r := inst.Config.Sample
-	if r >= 1 {
+	if inst.sampleMillion >= sampleScale {
 		return true
 	}
-	if r <= 0 {
+	if inst.sampleMillion == 0 {
 		return false
 	}
-	return hash01(level, inst.Name, body, project, role, profile, node, fields) <= r
+	return hashMillion(level, inst.Name, body, project, role, profile, node, fields) <= inst.sampleMillion
+}
+
+func (inst *Instance) prepare() {
+	switch {
+	case inst.Config.Sample <= 0:
+		inst.sampleMillion = 0
+	case inst.Config.Sample >= 1:
+		inst.sampleMillion = sampleScale
+	default:
+		inst.sampleMillion = uint64(inst.Config.Sample * float64(sampleScale))
+	}
+	inst.needsSample = inst.sampleMillion > 0 && inst.sampleMillion < sampleScale
+	inst.allLevels = true
+	for level := range levelStrings {
+		if !inst.Config.Levels[level] {
+			inst.allLevels = false
+			break
+		}
+	}
+}
+
+func (inst *Instance) allowAll() bool {
+	return inst.allLevels && inst.sampleMillion >= sampleScale
+}
+
+func (inst *Instance) allowLevelOnly(level Level) bool {
+	return inst.Config.Levels[level]
 }
 
 func normalizeLevels(cfg Config) Config {
@@ -123,7 +162,9 @@ func normalizeConfig(cfg Config) Config {
 	default:
 		cfg.Drop = DropOld
 	}
-	if cfg.Sample <= 0 {
+	if cfg.Sample < 0 {
+		cfg.Sample = 0
+	} else if cfg.Sample == 0 {
 		cfg.Sample = 1
 	}
 	if cfg.Sample > 1 {
@@ -133,7 +174,16 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
-func hash01(level Level, name, body, project, role, profile, node string, fields Map) float64 {
+const sampleScale uint64 = 1000000
+
+var fieldKeysPool = sync.Pool{
+	New: func() any {
+		keys := make([]string, 0, 16)
+		return &keys
+	},
+}
+
+func hashMillion(level Level, name, body, project, role, profile, node string, fields Map) uint64 {
 	h := fnv.New64a()
 	hashWrite(h, strconv.Itoa(level))
 	hashWrite(h, ":")
@@ -149,7 +199,8 @@ func hash01(level Level, name, body, project, role, profile, node string, fields
 	hashWrite(h, ":")
 	hashWrite(h, node)
 	if len(fields) > 0 {
-		keys := make([]string, 0, len(fields))
+		keysPtr := fieldKeysPool.Get().(*[]string)
+		keys := (*keysPtr)[:0]
 		for k := range fields {
 			keys = append(keys, k)
 		}
@@ -160,9 +211,12 @@ func hash01(level Level, name, body, project, role, profile, node string, fields
 			hashWrite(h, "=")
 			hashWrite(h, fmt.Sprint(fields[k]))
 		}
+		if cap(keys) <= 1024 {
+			*keysPtr = keys[:0]
+			fieldKeysPool.Put(keysPtr)
+		}
 	}
-	v := h.Sum64()
-	return float64(v%1000000) / 1000000.0
+	return h.Sum64() % sampleScale
 }
 
 func formatFields(fields Map) string {
@@ -181,6 +235,21 @@ func formatFields(fields Map) string {
 		b.WriteString(fmt.Sprint(fields[k]))
 	}
 	return b.String()
+}
+
+func stringifyFields(fields Map, encodeErr error) Map {
+	out := make(Map, len(fields)+1)
+	if encodeErr != nil {
+		out["_error"] = encodeErr.Error()
+	}
+	for key, value := range fields {
+		if _, err := json.Marshal(value); err == nil {
+			out[key] = value
+		} else {
+			out[key] = fmt.Sprint(value)
+		}
+	}
+	return out
 }
 
 type formatToken int

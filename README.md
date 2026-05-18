@@ -57,6 +57,11 @@ driver = "default"
 - `drop`
 - `setting`
 
+## 常用运行期 API
+
+- `Stats()`：返回队列、丢弃、同步降级、写入错误、延迟和连接级指标
+- `SetExitFunc(fn)`：替换 `Fatal/Fatalf/Fatalw` 的退出函数，便于测试 fatal 日志；返回值可恢复旧函数
+
 ## 说明
 
 - `setting` 一般用于向具体驱动透传专用参数

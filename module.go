@@ -28,6 +28,7 @@ type (
 	overflowMode int
 
 	instanceWriter struct {
+		module   *Module
 		instance *Instance
 		mode     overflowMode
 		queue    chan []Log
@@ -40,18 +41,27 @@ type (
 		lastWriteLatency atomic.Int64
 		totalWriteNs     atomic.Int64
 		writeCount       atomic.Int64
+		lastError        atomic.Value
+	}
+
+	instanceDispatcher struct {
+		instance *Instance
+		writer   *instanceWriter
 	}
 
 	Module struct {
-		mutex sync.RWMutex
+		mutex    sync.RWMutex
+		logsPool sync.Pool
 
 		opened  bool
 		started bool
 
-		configs   map[string]Config
-		drivers   map[string]Driver
-		instances map[string]*Instance
-		writers   map[string]*instanceWriter
+		configs      map[string]Config
+		drivers      map[string]Driver
+		instances    map[string]*Instance
+		instanceList []*Instance
+		writers      map[string]*instanceWriter
+		dispatchers  []instanceDispatcher
 
 		queue    chan Log
 		stopChan chan struct{}
@@ -70,6 +80,8 @@ type (
 		lastFlushLatencyMs    atomic.Int64
 		lastDispatchLatencyMs atomic.Int64
 		totalDispatchNs       atomic.Int64
+		lastDropUnix          atomic.Int64
+		lastError             atomic.Value
 	}
 
 	Configs map[string]Config
@@ -210,7 +222,11 @@ func (m *Module) configure(name string, conf Map) {
 		cfg.Levels = levels
 	}
 	if v, ok := parseFloat(conf["sample"]); ok {
-		cfg.Sample = v
+		if v <= 0 {
+			cfg.Sample = -1
+		} else {
+			cfg.Sample = v
+		}
 	}
 	if v, ok := conf["json"].(bool); ok {
 		cfg.Json = v
@@ -281,6 +297,7 @@ func (m *Module) Open() {
 			_ = conn.Close()
 		}
 		m.instances = make(map[string]*Instance, 0)
+		m.instanceList = nil
 	}
 	for name, cfg := range m.configs {
 		driver := m.drivers[cfg.Driver]
@@ -294,6 +311,7 @@ func (m *Module) Open() {
 			Config:  cfg,
 			Setting: cfg.Setting,
 		}
+		inst.prepare()
 
 		conn, err := driver.Connect(inst)
 		if err != nil {
@@ -307,6 +325,7 @@ func (m *Module) Open() {
 		}
 		inst.connect = conn
 		m.instances[name] = inst
+		m.instanceList = append(m.instanceList, inst)
 		opened = append(opened, conn)
 	}
 
@@ -325,7 +344,7 @@ func (m *Module) Start() {
 	flushEvery := time.Millisecond * 200
 	batchSize := 512
 	mode := overflowDropNewest
-	for _, inst := range m.instances {
+	for _, inst := range m.instanceList {
 		if inst.Config.Buffer > bufferSize {
 			bufferSize = inst.Config.Buffer
 		}
@@ -354,9 +373,16 @@ func (m *Module) Start() {
 		if workerQueueSize <= 0 {
 			workerQueueSize = 256
 		}
-		worker := newInstanceWriter(inst, parseOverflow(inst.Config), workerQueueSize)
+		worker := newInstanceWriter(m, inst, parseOverflow(inst.Config), workerQueueSize)
 		m.writers[name] = worker
 		worker.start()
+	}
+	m.dispatchers = make([]instanceDispatcher, 0, len(m.instances))
+	for _, inst := range m.instanceList {
+		m.dispatchers = append(m.dispatchers, instanceDispatcher{
+			instance: inst,
+			writer:   m.writers[inst.Name],
+		})
 	}
 	m.overflowMode = mode
 	m.batchSize = batchSize
@@ -370,6 +396,8 @@ func (m *Module) Start() {
 	m.lastFlushLatencyMs.Store(0)
 	m.lastDispatchLatencyMs.Store(0)
 	m.totalDispatchNs.Store(0)
+	m.lastDropUnix.Store(0)
+	m.lastError.Store("")
 	go m.loop(flushEvery, batchSize)
 
 	m.started = true
@@ -402,6 +430,8 @@ func (m *Module) Stop() {
 }
 
 func (m *Module) Close() {
+	m.Stop()
+
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -410,11 +440,15 @@ func (m *Module) Close() {
 	}
 
 	for _, inst := range m.instances {
+		inst.writeMu.Lock()
 		_ = inst.connect.Close()
+		inst.writeMu.Unlock()
 	}
 
 	m.instances = make(map[string]*Instance, 0)
+	m.instanceList = nil
 	m.writers = make(map[string]*instanceWriter, 0)
+	m.dispatchers = nil
 	m.opened = false
 }
 
@@ -436,8 +470,7 @@ func (m *Module) loop(flushEvery time.Duration, batchSize int) {
 		m.flushCount.Add(1)
 		m.flushLogCount.Add(int64(len(batch)))
 		if dropped > 0 {
-			m.dropCount.Add(int64(dropped))
-			atomic.AddUint64(&m.dropped, uint64(dropped))
+			m.recordDrop(dropped)
 		}
 		m.lastFlushLatencyMs.Store(latencyMs)
 		m.lastDispatchLatencyMs.Store(latencyMs)
@@ -478,45 +511,196 @@ func (m *Module) reportDropped() {
 	_, _ = fmt.Fprintf(os.Stderr, "infrago log queue is full, dropped %d entries\n", n)
 }
 
+func (m *Module) recordDrop(n int) {
+	if n <= 0 {
+		return
+	}
+	m.dropCount.Add(int64(n))
+	m.markDropTime()
+	atomic.AddUint64(&m.dropped, uint64(n))
+}
+
+func (m *Module) markDropTime() {
+	now := time.Now().Unix()
+	if m.lastDropUnix.Load() != now {
+		m.lastDropUnix.Store(now)
+	}
+}
+
+func (m *Module) recordWriteError(err error) {
+	if err == nil {
+		return
+	}
+	m.writeErrorCount.Add(1)
+	m.lastError.Store(err.Error())
+}
+
 func (m *Module) dispatch(entries []Log) int {
 	m.mutex.RLock()
-	instances := make([]*Instance, 0, len(m.instances))
-	writers := make(map[string]*instanceWriter, len(m.writers))
-	for _, inst := range m.instances {
-		instances = append(instances, inst)
-	}
-	for name, writer := range m.writers {
-		writers[name] = writer
-	}
+	dispatchers := m.dispatchers
 	m.mutex.RUnlock()
 
 	dropped := 0
-	for _, inst := range instances {
-		filtered := make([]Log, 0, len(entries))
-		for _, entry := range entries {
-			if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
-				filtered = append(filtered, entry)
-			}
-		}
-		if len(filtered) == 0 {
-			continue
-		}
-		writer := writers[inst.Name]
-		if writer == nil {
-			if err := inst.connect.Write(filtered...); err != nil {
-				_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
-				m.writeErrorCount.Add(1)
+	for _, dispatcher := range dispatchers {
+		inst := dispatcher.instance
+		if inst.allowAll() {
+			if n := m.dispatchEntries(dispatcher, entries, false); n > 0 {
+				dropped += n
 			}
 			continue
 		}
-		if n := writer.enqueue(filtered); n > 0 {
+
+		filtered := m.getLogSlice(len(entries))
+		if inst.needsSample {
+			for _, entry := range entries {
+				if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
+					filtered = append(filtered, entry)
+				}
+			}
+		} else {
+			for _, entry := range entries {
+				if inst.allowLevelOnly(entry.Level) {
+					filtered = append(filtered, entry)
+				}
+			}
+		}
+		if n := m.dispatchEntries(dispatcher, filtered, true); n > 0 {
 			dropped += n
 		}
 	}
 	return dropped
 }
 
+func (m *Module) dispatchEntries(dispatcher instanceDispatcher, entries []Log, pooled bool) int {
+	if len(entries) == 0 {
+		if pooled {
+			m.putLogSlice(entries)
+		}
+		return 0
+	}
+
+	inst := dispatcher.instance
+	writer := dispatcher.writer
+	if writer == nil {
+		inst.writeMu.RLock()
+		if err := inst.connect.Write(entries...); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
+			m.recordWriteError(err)
+		}
+		inst.writeMu.RUnlock()
+		if pooled {
+			m.putLogSlice(entries)
+		}
+		return 0
+	}
+
+	if !pooled {
+		cloned := m.getLogSlice(len(entries))
+		cloned = append(cloned, entries...)
+		entries = cloned
+	}
+	return writer.enqueue(entries)
+}
+
+func (m *Module) getLogSlice(size int) []Log {
+	if value := m.logsPool.Get(); value != nil {
+		logs := value.([]Log)
+		if cap(logs) >= size {
+			return logs[:0]
+		}
+	}
+	return make([]Log, 0, size)
+}
+
+func (m *Module) putLogSlice(logs []Log) {
+	if logs == nil {
+		return
+	}
+	if cap(logs) > 65536 {
+		return
+	}
+	for i := range logs {
+		logs[i] = Log{}
+	}
+	m.logsPool.Put(logs[:0])
+}
+
 func (m *Module) Write(entry Log) {
+	entry = m.normalizeEntry(entry)
+
+	if m.enqueue(entry) {
+		return
+	}
+
+	m.writeSyncEntry(entry, true)
+}
+
+func (m *Module) enqueue(entry Log) bool {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for {
+		m.mutex.RLock()
+		if !m.started || m.queue == nil {
+			m.mutex.RUnlock()
+			return false
+		}
+		queue := m.queue
+		stopCh := m.stopChan
+		mode := m.overflowMode
+		select {
+		case queue <- entry:
+			m.queuedCount.Add(1)
+			m.mutex.RUnlock()
+			return true
+		default:
+		}
+		if mode == overflowBlock {
+			m.mutex.RUnlock()
+			if timer == nil {
+				timer = time.NewTimer(time.Millisecond)
+			} else {
+				timer.Reset(time.Millisecond)
+			}
+			select {
+			case <-stopCh:
+				return false
+			case <-timer.C:
+				continue
+			}
+		}
+		if mode == overflowDropOldest {
+			select {
+			case <-queue:
+				m.recordDrop(1)
+			default:
+			}
+			select {
+			case queue <- entry:
+				m.queuedCount.Add(1)
+				m.mutex.RUnlock()
+				return true
+			default:
+				m.recordDrop(1)
+				m.mutex.RUnlock()
+				return true
+			}
+		}
+		m.recordDrop(1)
+		m.mutex.RUnlock()
+		return true
+	}
+}
+
+func (m *Module) WriteSync(entry Log) {
+	m.writeSyncEntry(m.normalizeEntry(entry), true)
+}
+
+func (m *Module) normalizeEntry(entry Log) Log {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now()
 	}
@@ -524,65 +708,29 @@ func (m *Module) Write(entry Log) {
 		entry.Fields = cloneMap(entry.Fields)
 	}
 	entry = ensureIdentity(entry)
+	return entry
+}
 
-	m.mutex.RLock()
-	started := m.started
-	queue := m.queue
-	mode := m.overflowMode
-	m.mutex.RUnlock()
-
-	if started && queue != nil {
-		if mode == overflowBlock {
-			queue <- entry
-			m.queuedCount.Add(1)
-			return
-		}
-		select {
-		case queue <- entry:
-			m.queuedCount.Add(1)
-			return
-		default:
-			switch mode {
-			case overflowDropOldest:
-				select {
-				case <-queue:
-					m.dropCount.Add(1)
-					atomic.AddUint64(&m.dropped, 1)
-				default:
-				}
-				select {
-				case queue <- entry:
-					m.queuedCount.Add(1)
-					return
-				default:
-					m.dropCount.Add(1)
-					atomic.AddUint64(&m.dropped, 1)
-					return
-				}
-			default:
-				m.dropCount.Add(1)
-				atomic.AddUint64(&m.dropped, 1)
-			}
-			return
-		}
+func (m *Module) writeSyncEntry(entry Log, fallback bool) {
+	if fallback {
+		m.syncFallbackCount.Add(1)
 	}
-	m.syncFallbackCount.Add(1)
 	start := time.Now()
 	writeErrors := 0
 	m.mutex.RLock()
-	instances := make([]*Instance, 0, len(m.instances))
-	for _, inst := range m.instances {
-		instances = append(instances, inst)
-	}
+	instances := m.instanceList
 	m.mutex.RUnlock()
 	for _, inst := range instances {
 		if !inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
 			continue
 		}
+		inst.writeMu.RLock()
 		if err := inst.connect.Write(entry); err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
+			m.lastError.Store(err.Error())
 			writeErrors++
 		}
+		inst.writeMu.RUnlock()
 	}
 	elapsed := time.Since(start)
 	m.flushCount.Add(1)
@@ -633,6 +781,7 @@ func (m *Module) Stats() Map {
 	if flushCount > 0 {
 		avgDispatchMs = (m.totalDispatchNs.Load() / flushCount) / int64(time.Millisecond)
 	}
+	lastError, _ := m.lastError.Load().(string)
 
 	return Map{
 		"started":                  started,
@@ -642,11 +791,14 @@ func (m *Module) Stats() Map {
 		"overflow":                 overflow,
 		"batch":                    batch,
 		"queued_count":             m.queuedCount.Load(),
+		"sync_write_count":         m.syncFallbackCount.Load(),
 		"sync_fallback_count":      m.syncFallbackCount.Load(),
 		"drop_count":               m.dropCount.Load(),
+		"last_drop_unix":           m.lastDropUnix.Load(),
 		"flush_count":              flushCount,
 		"flush_log_count":          m.flushLogCount.Load(),
 		"write_error_count":        m.writeErrorCount.Load(),
+		"last_error":               lastError,
 		"last_flush_latency_ms":    m.lastFlushLatencyMs.Load(),
 		"last_dispatch_latency_ms": m.lastDispatchLatencyMs.Load(),
 		"avg_dispatch_latency_ms":  avgDispatchMs,
@@ -667,11 +819,12 @@ func overflowModeName(mode overflowMode) string {
 	}
 }
 
-func newInstanceWriter(inst *Instance, mode overflowMode, queueSize int) *instanceWriter {
+func newInstanceWriter(module *Module, inst *Instance, mode overflowMode, queueSize int) *instanceWriter {
 	if queueSize <= 0 {
 		queueSize = 256
 	}
 	return &instanceWriter{
+		module:   module,
 		instance: inst,
 		mode:     mode,
 		queue:    make(chan []Log, queueSize),
@@ -686,36 +839,12 @@ func (w *instanceWriter) start() {
 		for {
 			select {
 			case entries := <-w.queue:
-				if len(entries) == 0 {
-					continue
-				}
-				start := time.Now()
-				if err := w.instance.connect.Write(entries...); err != nil {
-					_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
-					w.writeErrorCount.Add(1)
-					module.writeErrorCount.Add(1)
-				}
-				elapsed := time.Since(start)
-				w.lastWriteLatency.Store(elapsed.Milliseconds())
-				w.totalWriteNs.Add(elapsed.Nanoseconds())
-				w.writeCount.Add(1)
+				w.write(entries)
 			case <-w.stopChan:
 				for {
 					select {
 					case entries := <-w.queue:
-						if len(entries) == 0 {
-							continue
-						}
-						start := time.Now()
-						if err := w.instance.connect.Write(entries...); err != nil {
-							_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
-							w.writeErrorCount.Add(1)
-							module.writeErrorCount.Add(1)
-						}
-						elapsed := time.Since(start)
-						w.lastWriteLatency.Store(elapsed.Milliseconds())
-						w.totalWriteNs.Add(elapsed.Nanoseconds())
-						w.writeCount.Add(1)
+						w.write(entries)
 					default:
 						return
 					}
@@ -725,6 +854,26 @@ func (w *instanceWriter) start() {
 	}()
 }
 
+func (w *instanceWriter) write(entries []Log) {
+	defer w.module.putLogSlice(entries)
+	if len(entries) == 0 {
+		return
+	}
+	start := time.Now()
+	w.instance.writeMu.RLock()
+	if err := w.instance.connect.Write(entries...); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "log write failed:", err.Error())
+		w.writeErrorCount.Add(1)
+		w.lastError.Store(err.Error())
+		w.module.recordWriteError(err)
+	}
+	w.instance.writeMu.RUnlock()
+	elapsed := time.Since(start)
+	w.lastWriteLatency.Store(elapsed.Milliseconds())
+	w.totalWriteNs.Add(elapsed.Nanoseconds())
+	w.writeCount.Add(1)
+}
+
 func (w *instanceWriter) stop() {
 	close(w.stopChan)
 	<-w.doneChan
@@ -732,12 +881,38 @@ func (w *instanceWriter) stop() {
 
 func (w *instanceWriter) enqueue(entries []Log) int {
 	if len(entries) == 0 {
+		w.module.putLogSlice(entries)
 		return 0
 	}
 	if w.mode == overflowBlock {
-		w.queue <- entries
-		w.queuedCount.Add(int64(len(entries)))
-		return 0
+		var timer *time.Timer
+		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
+		}()
+		for {
+			select {
+			case w.queue <- entries:
+				w.queuedCount.Add(int64(len(entries)))
+				return 0
+			default:
+			}
+			if timer == nil {
+				timer = time.NewTimer(time.Millisecond)
+			} else {
+				timer.Reset(time.Millisecond)
+			}
+			select {
+			case <-w.stopChan:
+				dropped := len(entries)
+				w.dropCount.Add(int64(dropped))
+				w.module.markDropTime()
+				w.module.putLogSlice(entries)
+				return dropped
+			case <-timer.C:
+			}
+		}
 	}
 
 	select {
@@ -750,18 +925,24 @@ func (w *instanceWriter) enqueue(entries []Log) int {
 			case old := <-w.queue:
 				dropped := len(old)
 				w.dropCount.Add(int64(dropped))
+				w.module.markDropTime()
+				w.module.putLogSlice(old)
 				select {
 				case w.queue <- entries:
 					w.queuedCount.Add(int64(len(entries)))
 					return dropped
 				default:
 					w.dropCount.Add(int64(len(entries)))
+					w.module.markDropTime()
+					w.module.putLogSlice(entries)
 					return dropped + len(entries)
 				}
 			default:
 			}
 		}
 		w.dropCount.Add(int64(len(entries)))
+		w.module.markDropTime()
+		w.module.putLogSlice(entries)
 		return len(entries)
 	}
 }
@@ -774,12 +955,15 @@ func (w *instanceWriter) stats() Map {
 	if writeCount > 0 {
 		avgLatencyMs = (w.totalWriteNs.Load() / writeCount) / int64(time.Millisecond)
 	}
+	lastError, _ := w.lastError.Load().(string)
 	return Map{
 		"queue_len":             queueLen,
 		"queue_cap":             queueCap,
+		"overflow":              overflowModeName(w.mode),
 		"queued_count":          w.queuedCount.Load(),
 		"drop_count":            w.dropCount.Load(),
 		"write_error_count":     w.writeErrorCount.Load(),
+		"last_error":            lastError,
 		"last_write_latency_ms": w.lastWriteLatency.Load(),
 		"avg_write_latency_ms":  avgLatencyMs,
 	}
@@ -859,8 +1043,7 @@ func (m *Module) parseBody(args ...Any) string {
 	}
 
 	if format, ok := args[0].(string); ok {
-		verbCount := strings.Count(format, "%") - strings.Count(format, "%%")
-		if verbCount > 0 && verbCount == (len(args)-1) {
+		if verbCount, ok := formatArgCount(format); ok && verbCount > 0 && verbCount == (len(args)-1) {
 			return fmt.Sprintf(format, args[1:]...)
 		}
 	}
@@ -870,6 +1053,117 @@ func (m *Module) parseBody(args ...Any) string {
 		parts = append(parts, fmt.Sprintf("%v", arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+func formatArgCount(format string) (int, bool) {
+	count := 0
+	explicitMax := 0
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(format) {
+			return 0, false
+		}
+		if format[i] == '%' {
+			continue
+		}
+
+		valueIndexed := false
+		if next, index, ok := parseFormatIndex(format, i); ok {
+			i = next
+			valueIndexed = true
+			if index > explicitMax {
+				explicitMax = index
+			}
+		}
+		for i < len(format) && strings.ContainsRune("#0+-", rune(format[i])) {
+			i++
+		}
+		if i >= len(format) {
+			return 0, false
+		}
+		if next, index, ok := parseFormatIndex(format, i); ok {
+			i = next
+			if i >= len(format) || format[i] != '*' {
+				return 0, false
+			}
+			if index > explicitMax {
+				explicitMax = index
+			}
+			i++
+		} else if format[i] == '*' {
+			count++
+			i++
+		} else {
+			for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+				i++
+			}
+		}
+		if i < len(format) && format[i] == '.' {
+			i++
+			if i >= len(format) {
+				return 0, false
+			}
+			if next, index, ok := parseFormatIndex(format, i); ok {
+				i = next
+				if i >= len(format) || format[i] != '*' {
+					return 0, false
+				}
+				if index > explicitMax {
+					explicitMax = index
+				}
+				i++
+			} else if format[i] == '*' {
+				count++
+				i++
+			} else {
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+			}
+		}
+		if i >= len(format) {
+			return 0, false
+		}
+		if next, index, ok := parseFormatIndex(format, i); ok {
+			i = next
+			valueIndexed = true
+			if index > explicitMax {
+				explicitMax = index
+			}
+			if i >= len(format) {
+				return 0, false
+			}
+		}
+		if !strings.ContainsRune("vTtbcdoOqxXUeEfFgGsp", rune(format[i])) {
+			return 0, false
+		}
+		if !valueIndexed {
+			count++
+		}
+	}
+	if explicitMax > count {
+		count = explicitMax
+	}
+	return count, true
+}
+
+func parseFormatIndex(format string, pos int) (int, int, bool) {
+	if pos >= len(format) || format[pos] != '[' {
+		return pos, 0, false
+	}
+	end := pos + 1
+	index := 0
+	for end < len(format) && format[end] >= '0' && format[end] <= '9' {
+		index = index*10 + int(format[end]-'0')
+		end++
+	}
+	if end == pos+1 || end >= len(format) || format[end] != ']' || index <= 0 {
+		return pos, 0, false
+	}
+	return end + 1, index, true
 }
 
 func parseLevel(value Any) (Level, bool) {

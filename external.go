@@ -1,8 +1,37 @@
 package log
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"sync"
+)
 
 import . "github.com/infrago/base"
+
+var (
+	exitFuncMu sync.RWMutex
+	exitFunc   = os.Exit
+)
+
+func SetExitFunc(fn func(int)) func() {
+	if fn == nil {
+		fn = os.Exit
+	}
+	exitFuncMu.Lock()
+	previous := exitFunc
+	exitFunc = fn
+	exitFuncMu.Unlock()
+	return func() {
+		SetExitFunc(previous)
+	}
+}
+
+func callExit(code int) {
+	exitFuncMu.RLock()
+	fn := exitFunc
+	exitFuncMu.RUnlock()
+	fn(code)
+}
 
 func Levels() map[Level]string {
 	out := make(map[Level]string, len(levelStrings))
@@ -46,26 +75,41 @@ func Warningw(body string, fields Map) { module.Loggingw(LevelWarning, body, fie
 func Errorw(body string, fields Map)   { module.Loggingw(LevelError, body, fields) }
 
 func Panic(args ...Any) {
-	module.Logging(LevelPanic, args...)
-	panic(module.parseBody(args...))
+	body, fields := module.parseArgs(args...)
+	module.WriteSync(Log{Level: LevelPanic, Body: body, Fields: fields})
+	panic(panicValue(body, fields))
 }
 func Panicf(format string, args ...Any) {
-	module.Loggingf(LevelPanic, format, args...)
-	panic(fmt.Sprintf(format, args...))
-}
-func Panicw(body string, fields Map) {
-	module.Loggingw(LevelPanic, body, fields)
+	body := fmt.Sprintf(format, args...)
+	module.WriteSync(Log{Level: LevelPanic, Body: body})
 	panic(body)
 }
+func Panicw(body string, fields Map) {
+	module.WriteSync(Log{Level: LevelPanic, Body: body, Fields: fields})
+	panic(panicValue(body, fields))
+}
 
-func Fatal(args ...Any) { module.Logging(LevelFatal, args...) }
+func Fatal(args ...Any) {
+	body, fields := module.parseArgs(args...)
+	module.WriteSync(Log{Level: LevelFatal, Body: body, Fields: fields})
+	callExit(1)
+}
 func Fatalf(format string, args ...Any) {
-	module.Loggingf(LevelFatal, format, args...)
+	module.WriteSync(Log{Level: LevelFatal, Body: fmt.Sprintf(format, args...)})
+	callExit(1)
 }
 func Fatalw(body string, fields Map) {
-	module.Loggingw(LevelFatal, body, fields)
+	module.WriteSync(Log{Level: LevelFatal, Body: body, Fields: fields})
+	callExit(1)
 }
 
 func Stats() Map {
 	return module.Stats()
+}
+
+func panicValue(body string, fields Map) string {
+	if body != "" || len(fields) == 0 {
+		return body
+	}
+	return formatFields(fields)
 }

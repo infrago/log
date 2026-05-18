@@ -39,8 +39,8 @@ func TestFormatIncludesRole(t *testing.T) {
 }
 
 func TestHashUsesRole(t *testing.T) {
-	a := hash01(LevelInfo, "default", "hello", "demo", "site", "site-api", "n1", nil)
-	b := hash01(LevelInfo, "default", "hello", "demo", "worker", "site-api", "n1", nil)
+	a := hashMillion(LevelInfo, "default", "hello", "demo", "site", "site-api", "n1", nil)
+	b := hashMillion(LevelInfo, "default", "hello", "demo", "worker", "site-api", "n1", nil)
 	if a == b {
 		t.Fatalf("expected different roles to affect sampling hash")
 	}
