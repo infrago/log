@@ -18,10 +18,11 @@ func init() {
 }
 
 var module = &Module{
-	configs:   make(map[string]Config, 0),
-	drivers:   make(map[string]Driver, 0),
-	instances: make(map[string]*Instance, 0),
-	writers:   make(map[string]*instanceWriter, 0),
+	configs:     make(map[string]Config, 0),
+	drivers:     make(map[string]Driver, 0),
+	instances:   make(map[string]*Instance, 0),
+	writers:     make(map[string]*instanceWriter, 0),
+	cloneFields: true,
 }
 
 type (
@@ -31,7 +32,7 @@ type (
 		module   *Module
 		instance *Instance
 		mode     overflowMode
-		queue    chan []Log
+		queue    chan logBatch
 		stopChan chan struct{}
 		doneChan chan struct{}
 
@@ -49,19 +50,29 @@ type (
 		writer   *instanceWriter
 	}
 
+	logBatch struct {
+		entries []Log
+		refs    *atomic.Int32
+	}
+
 	Module struct {
-		mutex    sync.RWMutex
-		logsPool sync.Pool
+		mutex            sync.RWMutex
+		logsPool         sync.Pool
+		formatCache      sync.Map
+		formatCacheCount atomic.Int64
 
 		opened  bool
 		started bool
 
-		configs      map[string]Config
-		drivers      map[string]Driver
-		instances    map[string]*Instance
-		instanceList []*Instance
-		writers      map[string]*instanceWriter
-		dispatchers  []instanceDispatcher
+		configs                map[string]Config
+		drivers                map[string]Driver
+		instances              map[string]*Instance
+		instanceList           []*Instance
+		writers                map[string]*instanceWriter
+		dispatchers            []instanceDispatcher
+		levelDispatchers       [LevelDebug + 1][]int
+		customLevelDispatchers []int
+		cloneFields            bool
 
 		queue    chan Log
 		stopChan chan struct{}
@@ -86,20 +97,21 @@ type (
 
 	Configs map[string]Config
 	Config  struct {
-		Driver   string
-		Level    Level
-		Levels   map[Level]bool
-		Sample   float64
-		Json     bool
-		Buffer   int
-		Batch    int
-		Timeout  time.Duration
-		Block    bool
-		Overflow string
-		Drop     string
-		Flag     string
-		Format   string
-		Setting  Map
+		Driver       string
+		Level        Level
+		Levels       map[Level]bool
+		Sample       float64
+		Json         bool
+		UnsafeFields bool
+		Buffer       int
+		Batch        int
+		Timeout      time.Duration
+		Block        bool
+		Overflow     string
+		Drop         string
+		Flag         string
+		Format       string
+		Setting      Map
 	}
 
 	Log struct {
@@ -231,6 +243,18 @@ func (m *Module) configure(name string, conf Map) {
 	if v, ok := conf["json"].(bool); ok {
 		cfg.Json = v
 	}
+	if v, ok := parseBool(conf["unsafe_fields"]); ok {
+		cfg.UnsafeFields = v
+	}
+	if v, ok := parseBool(conf["unsafefields"]); ok {
+		cfg.UnsafeFields = v
+	}
+	if v, ok := parseBool(conf["clone_fields"]); ok {
+		cfg.UnsafeFields = !v
+	}
+	if v, ok := parseBool(conf["clonefields"]); ok {
+		cfg.UnsafeFields = !v
+	}
 	if v, ok := conf["flag"].(string); ok {
 		cfg.Flag = v
 	}
@@ -329,6 +353,16 @@ func (m *Module) Open() {
 		opened = append(opened, conn)
 	}
 
+	m.cloneFields = true
+	if len(m.instanceList) > 0 {
+		m.cloneFields = false
+		for _, inst := range m.instanceList {
+			if !inst.Config.UnsafeFields {
+				m.cloneFields = true
+				break
+			}
+		}
+	}
 	m.opened = true
 }
 
@@ -384,6 +418,7 @@ func (m *Module) Start() {
 			writer:   m.writers[inst.Name],
 		})
 	}
+	m.prepareDispatchTargets()
 	m.overflowMode = mode
 	m.batchSize = batchSize
 	atomic.StoreUint64(&m.dropped, 0)
@@ -449,6 +484,11 @@ func (m *Module) Close() {
 	m.instanceList = nil
 	m.writers = make(map[string]*instanceWriter, 0)
 	m.dispatchers = nil
+	m.customLevelDispatchers = nil
+	for idx := range m.levelDispatchers {
+		m.levelDispatchers[idx] = nil
+	}
+	m.cloneFields = true
 	m.opened = false
 }
 
@@ -535,37 +575,104 @@ func (m *Module) recordWriteError(err error) {
 	m.lastError.Store(err.Error())
 }
 
+func (m *Module) prepareDispatchTargets() {
+	for idx := range m.levelDispatchers {
+		m.levelDispatchers[idx] = m.levelDispatchers[idx][:0]
+	}
+	m.customLevelDispatchers = m.customLevelDispatchers[:0]
+	for idx, dispatcher := range m.dispatchers {
+		inst := dispatcher.instance
+		if inst.allowAll() || inst.needsSample {
+			continue
+		}
+		if inst.customLevels {
+			m.customLevelDispatchers = append(m.customLevelDispatchers, idx)
+			continue
+		}
+		for _, level := range inst.allowedLevels {
+			if level >= LevelFatal && level <= LevelDebug {
+				m.levelDispatchers[level] = append(m.levelDispatchers[level], idx)
+			}
+		}
+	}
+}
+
 func (m *Module) dispatch(entries []Log) int {
 	m.mutex.RLock()
 	dispatchers := m.dispatchers
+	levelDispatchers := m.levelDispatchers
+	customLevelDispatchers := m.customLevelDispatchers
 	m.mutex.RUnlock()
 
 	dropped := 0
+	levelBatches := make([][]Log, len(dispatchers))
+	allAsync := make([]instanceDispatcher, 0, len(dispatchers))
 	for _, dispatcher := range dispatchers {
 		inst := dispatcher.instance
 		if inst.allowAll() {
-			if n := m.dispatchEntries(dispatcher, entries, false); n > 0 {
-				dropped += n
+			if dispatcher.writer == nil {
+				if n := m.dispatchEntries(dispatcher, entries, false); n > 0 {
+					dropped += n
+				}
+			} else {
+				allAsync = append(allAsync, dispatcher)
 			}
 			continue
 		}
 
-		filtered := m.getLogSlice(len(entries))
 		if inst.needsSample {
+			filtered := m.getLogSlice(len(entries))
 			for _, entry := range entries {
 				if inst.Allow(entry.Level, entry.Body, entry.Project, entry.Role, entry.Profile, entry.Node, entry.Fields) {
 					filtered = append(filtered, entry)
 				}
 			}
-		} else {
-			for _, entry := range entries {
-				if inst.allowLevelOnly(entry.Level) {
-					filtered = append(filtered, entry)
+			if n := m.dispatchEntries(dispatcher, filtered, true); n > 0 {
+				dropped += n
+			}
+			continue
+		}
+	}
+
+	if len(levelDispatchers) > 0 || len(customLevelDispatchers) > 0 {
+		for _, entry := range entries {
+			if entry.Level >= LevelFatal && entry.Level <= LevelDebug {
+				for _, idx := range levelDispatchers[entry.Level] {
+					if levelBatches[idx] == nil {
+						levelBatches[idx] = m.getLogSlice(len(entries))
+					}
+					levelBatches[idx] = append(levelBatches[idx], entry)
+				}
+			}
+			for _, idx := range customLevelDispatchers {
+				if dispatchers[idx].instance.allowLevelOnly(entry.Level) {
+					if levelBatches[idx] == nil {
+						levelBatches[idx] = m.getLogSlice(len(entries))
+					}
+					levelBatches[idx] = append(levelBatches[idx], entry)
 				}
 			}
 		}
-		if n := m.dispatchEntries(dispatcher, filtered, true); n > 0 {
-			dropped += n
+
+		for idx, batch := range levelBatches {
+			if batch == nil {
+				continue
+			}
+			if n := m.dispatchEntries(dispatchers[idx], batch, true); n > 0 {
+				dropped += n
+			}
+		}
+	}
+	if len(allAsync) > 0 {
+		cloned := m.getLogSlice(len(entries))
+		cloned = append(cloned, entries...)
+		var refs atomic.Int32
+		refs.Store(int32(len(allAsync)))
+		batch := logBatch{entries: cloned, refs: &refs}
+		for _, dispatcher := range allAsync {
+			if n := dispatcher.writer.enqueue(batch); n > 0 {
+				dropped += n
+			}
 		}
 	}
 	return dropped
@@ -599,7 +706,16 @@ func (m *Module) dispatchEntries(dispatcher instanceDispatcher, entries []Log, p
 		cloned = append(cloned, entries...)
 		entries = cloned
 	}
-	return writer.enqueue(entries)
+	return writer.enqueue(logBatch{entries: entries})
+}
+
+func (m *Module) releaseBatch(batch logBatch) {
+	if batch.refs != nil {
+		if batch.refs.Add(-1) != 0 {
+			return
+		}
+	}
+	m.putLogSlice(batch.entries)
 }
 
 func (m *Module) getLogSlice(size int) []Log {
@@ -704,11 +820,15 @@ func (m *Module) normalizeEntry(entry Log) Log {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now()
 	}
-	if entry.Fields != nil {
+	if entry.Fields != nil && m.shouldCloneFields() {
 		entry.Fields = cloneMap(entry.Fields)
 	}
 	entry = ensureIdentity(entry)
 	return entry
+}
+
+func (m *Module) shouldCloneFields() bool {
+	return !m.opened || m.cloneFields
 }
 
 func (m *Module) writeSyncEntry(entry Log, fallback bool) {
@@ -827,7 +947,7 @@ func newInstanceWriter(module *Module, inst *Instance, mode overflowMode, queueS
 		module:   module,
 		instance: inst,
 		mode:     mode,
-		queue:    make(chan []Log, queueSize),
+		queue:    make(chan logBatch, queueSize),
 		stopChan: make(chan struct{}),
 		doneChan: make(chan struct{}),
 	}
@@ -838,13 +958,13 @@ func (w *instanceWriter) start() {
 		defer close(w.doneChan)
 		for {
 			select {
-			case entries := <-w.queue:
-				w.write(entries)
+			case batch := <-w.queue:
+				w.write(batch)
 			case <-w.stopChan:
 				for {
 					select {
-					case entries := <-w.queue:
-						w.write(entries)
+					case batch := <-w.queue:
+						w.write(batch)
 					default:
 						return
 					}
@@ -854,8 +974,9 @@ func (w *instanceWriter) start() {
 	}()
 }
 
-func (w *instanceWriter) write(entries []Log) {
-	defer w.module.putLogSlice(entries)
+func (w *instanceWriter) write(batch logBatch) {
+	entries := batch.entries
+	defer w.module.releaseBatch(batch)
 	if len(entries) == 0 {
 		return
 	}
@@ -879,9 +1000,10 @@ func (w *instanceWriter) stop() {
 	<-w.doneChan
 }
 
-func (w *instanceWriter) enqueue(entries []Log) int {
+func (w *instanceWriter) enqueue(batch logBatch) int {
+	entries := batch.entries
 	if len(entries) == 0 {
-		w.module.putLogSlice(entries)
+		w.module.releaseBatch(batch)
 		return 0
 	}
 	if w.mode == overflowBlock {
@@ -893,7 +1015,7 @@ func (w *instanceWriter) enqueue(entries []Log) int {
 		}()
 		for {
 			select {
-			case w.queue <- entries:
+			case w.queue <- batch:
 				w.queuedCount.Add(int64(len(entries)))
 				return 0
 			default:
@@ -908,7 +1030,7 @@ func (w *instanceWriter) enqueue(entries []Log) int {
 				dropped := len(entries)
 				w.dropCount.Add(int64(dropped))
 				w.module.markDropTime()
-				w.module.putLogSlice(entries)
+				w.module.releaseBatch(batch)
 				return dropped
 			case <-timer.C:
 			}
@@ -916,25 +1038,25 @@ func (w *instanceWriter) enqueue(entries []Log) int {
 	}
 
 	select {
-	case w.queue <- entries:
+	case w.queue <- batch:
 		w.queuedCount.Add(int64(len(entries)))
 		return 0
 	default:
 		if w.mode == overflowDropOldest {
 			select {
 			case old := <-w.queue:
-				dropped := len(old)
+				dropped := len(old.entries)
 				w.dropCount.Add(int64(dropped))
 				w.module.markDropTime()
-				w.module.putLogSlice(old)
+				w.module.releaseBatch(old)
 				select {
-				case w.queue <- entries:
+				case w.queue <- batch:
 					w.queuedCount.Add(int64(len(entries)))
 					return dropped
 				default:
 					w.dropCount.Add(int64(len(entries)))
 					w.module.markDropTime()
-					w.module.putLogSlice(entries)
+					w.module.releaseBatch(batch)
 					return dropped + len(entries)
 				}
 			default:
@@ -942,7 +1064,7 @@ func (w *instanceWriter) enqueue(entries []Log) int {
 		}
 		w.dropCount.Add(int64(len(entries)))
 		w.module.markDropTime()
-		w.module.putLogSlice(entries)
+		w.module.releaseBatch(batch)
 		return len(entries)
 	}
 }
@@ -1015,7 +1137,7 @@ func (m *Module) Loggingw(level Level, body string, fields Map) {
 		Time:   time.Now(),
 		Level:  level,
 		Body:   body,
-		Fields: cloneMap(fields),
+		Fields: fields,
 	})
 }
 
@@ -1025,13 +1147,13 @@ func (m *Module) parseArgs(args ...Any) (string, Map) {
 	}
 	if len(args) == 1 {
 		if m, ok := args[0].(Map); ok {
-			return "", cloneMap(m)
+			return "", m
 		}
 		return fmt.Sprintf("%v", args[0]), nil
 	}
 
 	if last, ok := args[len(args)-1].(Map); ok {
-		return m.parseBody(args[:len(args)-1]...), cloneMap(last)
+		return m.parseBody(args[:len(args)-1]...), last
 	}
 
 	return m.parseBody(args...), nil
@@ -1043,7 +1165,7 @@ func (m *Module) parseBody(args ...Any) string {
 	}
 
 	if format, ok := args[0].(string); ok {
-		if verbCount, ok := formatArgCount(format); ok && verbCount > 0 && verbCount == (len(args)-1) {
+		if verbCount, ok := m.formatArgCount(format); ok && verbCount > 0 && verbCount == (len(args)-1) {
 			return fmt.Sprintf(format, args[1:]...)
 		}
 	}
@@ -1053,6 +1175,30 @@ func (m *Module) parseBody(args ...Any) string {
 		parts = append(parts, fmt.Sprintf("%v", arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+type formatArgCountResult struct {
+	count int
+	ok    bool
+}
+
+const maxFormatCacheEntries int64 = 1024
+
+func (m *Module) formatArgCount(format string) (int, bool) {
+	if strings.IndexByte(format, '%') < 0 {
+		return 0, false
+	}
+	if value, ok := m.formatCache.Load(format); ok {
+		result := value.(formatArgCountResult)
+		return result.count, result.ok
+	}
+	count, ok := formatArgCount(format)
+	if ok && count > 0 && m.formatCacheCount.Load() < maxFormatCacheEntries {
+		if _, loaded := m.formatCache.LoadOrStore(format, formatArgCountResult{count: count, ok: ok}); !loaded {
+			m.formatCacheCount.Add(1)
+		}
+	}
+	return count, ok
 }
 
 func formatArgCount(format string) (int, bool) {

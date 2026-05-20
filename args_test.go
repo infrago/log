@@ -110,6 +110,38 @@ func TestInstancePrepareMarksAllowAllFastPath(t *testing.T) {
 	}
 }
 
+func TestDispatchLevelFastPathPreservesEntryOrder(t *testing.T) {
+	conn := &captureConnection{}
+	inst := &Instance{
+		Name: "default",
+		Config: normalizeConfig(Config{
+			Levels: map[Level]bool{
+				LevelInfo:  true,
+				LevelError: true,
+			},
+			Sample: 1,
+		}),
+		connect: conn,
+	}
+	inst.prepare()
+	m := &Module{
+		dispatchers: []instanceDispatcher{{instance: inst}},
+	}
+	m.prepareDispatchTargets()
+
+	m.dispatch([]Log{
+		{Level: LevelError, Body: "error-1"},
+		{Level: LevelTrace, Body: "trace"},
+		{Level: LevelInfo, Body: "info"},
+		{Level: LevelError, Body: "error-2"},
+	})
+
+	got := strings.Join(conn.bodies, ",")
+	if got != "error-1,info,error-2" {
+		t.Fatalf("expected filtered logs to preserve input order, got %q", got)
+	}
+}
+
 func TestJSONFormatFallsBackForUnmarshalableFields(t *testing.T) {
 	inst := &Instance{
 		Name: "default",
@@ -179,6 +211,29 @@ func TestStatsExposeOperationalFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeEntryCanSkipFieldCloneForUnsafeMode(t *testing.T) {
+	fields := Map{"x": 1}
+	m := &Module{opened: true, cloneFields: false}
+	entry := m.normalizeEntry(Log{Level: LevelInfo, Body: "unsafe", Fields: fields})
+	fields["x"] = 2
+	if entry.Fields["x"] != 2 {
+		t.Fatalf("expected unsafe mode to keep original fields map, got %#v", entry.Fields["x"])
+	}
+}
+
 type assertErr string
 
 func (e assertErr) Error() string { return string(e) }
+
+type captureConnection struct {
+	bodies []string
+}
+
+func (c *captureConnection) Open() error  { return nil }
+func (c *captureConnection) Close() error { return nil }
+func (c *captureConnection) Write(logs ...Log) error {
+	for _, entry := range logs {
+		c.bodies = append(c.bodies, entry.Body)
+	}
+	return nil
+}

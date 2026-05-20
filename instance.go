@@ -29,37 +29,16 @@ type Instance struct {
 	sampleMillion uint64
 	allLevels     bool
 	needsSample   bool
+	customLevels  bool
+	levelMask     uint64
+	allowedLevels []Level
 }
 
 const logTimeFormat = "2006-01-02 15:04:05.000000"
 
 func (inst *Instance) Format(entry Log) string {
 	if inst.Config.Json {
-		payload := map[string]any{
-			"time":    entry.Time.Format(logTimeFormat),
-			"unix":    entry.Time.Unix(),
-			"nano":    entry.Time.UnixNano(),
-			"level":   levelStrings[entry.Level],
-			"flag":    inst.Config.Flag,
-			"body":    entry.Body,
-			"project": entry.Project,
-			"role":    entry.Role,
-			"profile": entry.Profile,
-			"node":    entry.Node,
-		}
-		if len(entry.Fields) > 0 {
-			payload["fields"] = entry.Fields
-		}
-		body, err := json.Marshal(payload)
-		if err == nil {
-			return string(body)
-		}
-		payload["fields"] = stringifyFields(entry.Fields, err)
-		body, err = json.Marshal(payload)
-		if err == nil {
-			return string(body)
-		}
-		return inst.formatText(entry) + " " + formatFields(entry.Fields)
+		return inst.formatJSON(entry)
 	}
 
 	message := inst.formatText(entry)
@@ -68,6 +47,58 @@ func (inst *Instance) Format(entry Log) string {
 	}
 
 	return message
+}
+
+func (inst *Instance) formatJSON(entry Log) string {
+	var fields []byte
+	if len(entry.Fields) > 0 {
+		var err error
+		fields, err = json.Marshal(entry.Fields)
+		if err != nil {
+			fields, err = json.Marshal(stringifyFields(entry.Fields, err))
+			if err != nil {
+				return inst.formatText(entry) + " " + formatFields(entry.Fields)
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.Grow(len(entry.Body) + len(entry.Project) + len(entry.Role) + len(entry.Profile) + len(entry.Node) + len(fields) + 160)
+	b.WriteByte('{')
+	writeJSONField(&b, "time", entry.Time.Format(logTimeFormat), false)
+	writeJSONIntField(&b, "unix", entry.Time.Unix())
+	writeJSONIntField(&b, "nano", entry.Time.UnixNano())
+	writeJSONField(&b, "level", levelStrings[entry.Level], true)
+	writeJSONField(&b, "flag", inst.Config.Flag, true)
+	writeJSONField(&b, "body", entry.Body, true)
+	writeJSONField(&b, "project", entry.Project, true)
+	writeJSONField(&b, "role", entry.Role, true)
+	writeJSONField(&b, "profile", entry.Profile, true)
+	writeJSONField(&b, "node", entry.Node, true)
+	if len(fields) > 0 {
+		b.WriteString(`,"fields":`)
+		b.Write(fields)
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+func writeJSONField(b *strings.Builder, key, value string, comma bool) {
+	if comma {
+		b.WriteByte(',')
+	}
+	b.WriteByte('"')
+	b.WriteString(key)
+	b.WriteString(`":`)
+	b.WriteString(strconv.Quote(value))
+}
+
+func writeJSONIntField(b *strings.Builder, key string, value int64) {
+	b.WriteByte(',')
+	b.WriteByte('"')
+	b.WriteString(key)
+	b.WriteString(`":`)
+	b.WriteString(strconv.FormatInt(value, 10))
 }
 
 func (inst *Instance) Allow(level Level, body, project, role, profile, node string, fields Map) bool {
@@ -94,8 +125,22 @@ func (inst *Instance) prepare() {
 	}
 	inst.needsSample = inst.sampleMillion > 0 && inst.sampleMillion < sampleScale
 	inst.allLevels = true
+	inst.customLevels = false
+	inst.levelMask = 0
+	inst.allowedLevels = inst.allowedLevels[:0]
 	for level := range levelStrings {
-		if !inst.Config.Levels[level] {
+		if inst.Config.Levels[level] {
+			inst.allowedLevels = append(inst.allowedLevels, level)
+			if bit, ok := levelBit(level); ok {
+				inst.levelMask |= bit
+			}
+		} else {
+			inst.allLevels = false
+		}
+	}
+	for level, allowed := range inst.Config.Levels {
+		if allowed && (level < LevelFatal || level > LevelDebug) {
+			inst.customLevels = true
 			inst.allLevels = false
 			break
 		}
@@ -108,6 +153,13 @@ func (inst *Instance) allowAll() bool {
 
 func (inst *Instance) allowLevelOnly(level Level) bool {
 	return inst.Config.Levels[level]
+}
+
+func levelBit(level Level) (uint64, bool) {
+	if level < 0 || level >= 64 {
+		return 0, false
+	}
+	return uint64(1) << uint(level), true
 }
 
 func normalizeLevels(cfg Config) Config {
@@ -199,33 +251,23 @@ func hashMillion(level Level, name, body, project, role, profile, node string, f
 	hashWrite(h, ":")
 	hashWrite(h, node)
 	if len(fields) > 0 {
-		keysPtr := fieldKeysPool.Get().(*[]string)
-		keys := (*keysPtr)[:0]
-		for k := range fields {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+		keysPtr, keys := sortedFieldKeys(fields)
 		for _, k := range keys {
 			hashWrite(h, "|")
 			hashWrite(h, k)
 			hashWrite(h, "=")
 			hashWrite(h, fmt.Sprint(fields[k]))
 		}
-		if cap(keys) <= 1024 {
-			*keysPtr = keys[:0]
-			fieldKeysPool.Put(keysPtr)
-		}
+		putFieldKeys(keysPtr, keys)
 	}
 	return h.Sum64() % sampleScale
 }
 
 func formatFields(fields Map) string {
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keysPtr, keys := sortedFieldKeys(fields)
+	defer putFieldKeys(keysPtr, keys)
 	var b strings.Builder
+	b.Grow(len(fields) * 16)
 	for _, k := range keys {
 		if b.Len() > 0 {
 			b.WriteByte(' ')
@@ -235,6 +277,27 @@ func formatFields(fields Map) string {
 		b.WriteString(fmt.Sprint(fields[k]))
 	}
 	return b.String()
+}
+
+func sortedFieldKeys(fields Map) (*[]string, []string) {
+	keysPtr := fieldKeysPool.Get().(*[]string)
+	keys := (*keysPtr)[:0]
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keysPtr, keys
+}
+
+func putFieldKeys(keysPtr *[]string, keys []string) {
+	if cap(keys) > 1024 {
+		return
+	}
+	for i := range keys {
+		keys[i] = ""
+	}
+	*keysPtr = keys[:0]
+	fieldKeysPool.Put(keysPtr)
 }
 
 func stringifyFields(fields Map, encodeErr error) Map {

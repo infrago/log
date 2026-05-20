@@ -47,6 +47,7 @@ driver = "default"
 - `levels`
 - `sample`
 - `json`
+- `unsafe_fields`
 - `flag`
 - `format`
 - `buffer`
